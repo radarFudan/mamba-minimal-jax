@@ -130,7 +130,7 @@ class Mamba(nn.Module):
         def load_state_dict_hf(model_name, device=None, dtype=None):
             resolved_archive_file = cached_file(model_name, WEIGHTS_NAME,
                                                 _raise_exceptions_for_missing_entries=False)
-            return torch.load(resolved_archive_file, weights_only=True)
+            return torch.load(resolved_archive_file, weights_only=True, map_location=torch.device('cpu'), mmap=True)
         
         config_data = load_config_hf(pretrained_model_name)
         args = ModelArgs(
@@ -245,11 +245,6 @@ class MambaBlock(nn.Module):
         # TODO, summarize the difference between torch and jax convolution! 
         x = self.conv1d(x)[:, :l, :]
 
-        # torch version. 
-        # x = rearrange(x, 'b l d_in -> b d_in l')
-        # x = self.conv1d(x)[:, :, :l]
-        # x = rearrange(x, 'b d_in l -> b l d_in')
-        
         x = jax.nn.silu(x)
 
         y = self.ssm(x)
@@ -333,7 +328,6 @@ class MambaBlock(nn.Module):
         deltaB_u = np.einsum('b l d, b l n, b l d -> b l d n', delta, B, u)
 
         # Perform selective scan (see scan_SSM() in The Annotated S4 [2])
-        # x = torch.zeros((b, d_in, n), device=deltaA.device)
         x = np.zeros((b, d_in, n))
         ys = []    
         for i in range(l):
