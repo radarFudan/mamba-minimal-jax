@@ -1,0 +1,5 @@
+einops==0.7.0
+flax==0.7.0
+jax==0.4.13
+torch==2.0.1
+transformers==4.31.0
