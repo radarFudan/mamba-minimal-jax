@@ -320,23 +320,31 @@ class MambaBlock(nn.Module):
             Note: I refactored some parts out of `selective_scan_ref` out, so the functionality doesn't match exactly.
             
         """
-        (b, l, d_in) = u.shape
-        n = A.shape[1]
-
         # Discretize continuous parameters (A, B)
         deltaA = np.exp(np.einsum('b l d, d n -> b l d n', delta, A))
         deltaB_u = np.einsum('b l d, b l n, b l d -> b l d n', delta, B, u)
 
-        # Perform selective scan (see scan_SSM() in The Annotated S4 [2])
-        x = np.zeros((b, d_in, n))
-        ys = []    
-        for i in range(l):
-            x = deltaA[:, i] * x + deltaB_u[:, i]
-            y = np.einsum('b d n, b n -> b d', x, C[:, i, :])
-            ys.append(y)
-        y = np.stack(ys, axis=1) + u * D # shape (b, l, d_in)
+        _, hs = jax.lax.associative_scan(binary_operator, (deltaA, deltaB_u), axis=1)
+
+        h = np.stack(hs, axis=0)  # shape (b, l, d_in, n)
+        y = np.einsum('b l d n, b l n -> b l d', h, C) + u * D
 
         return y
+
+
+# Parallel scan operations
+@jax.vmap
+def binary_operator(q_i, q_j):
+    """ Binary operator for parallel scan of linear recurrence. Assumes a diagonal matrix A.
+        Args:
+            q_i: tuple containing A_i and Bu_i at position i       (D,N), (D,N)
+            q_j: tuple containing A_j and Bu_j at position j       (D,N), (D,N)
+        Returns:
+            new element ( A_out, Bu_out )
+    """
+    A_i, b_i = q_i
+    A_j, b_j = q_j
+    return A_j * A_i, A_j * b_i + b_j
 
 
 class RMSNorm(nn.Module):

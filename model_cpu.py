@@ -334,7 +334,9 @@ class MambaBlock(nn.Module):
             x = deltaA[:, i] * x + deltaB_u[:, i]
             y = np.einsum('b d n, b n -> b d', x, C[:, i, :])
             ys.append(y)
-        y = np.stack(ys, axis=1) + u * D # shape (b, l, d_in)
+        y = np.stack(ys, axis=1)  # shape (b, l, d_in)
+        
+        y = y + u * D
 
         return y
 
