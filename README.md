@@ -5,9 +5,10 @@ Plan:
 1. First finish the `model.py`, done. 
 2. Convert the pytorch weights into the JAX weights, done. 
 3. Check the results of greedy generation is the same as pytorch, done. 
-4. Implement the associative scan so that the state update is faster, in progress. 
-    https://github.com/srush/annotated-mamba/issues/1
-5. Pay attention to the initialization so that we can train the model from scratch. 
+4. Implement the associative scan so that the state update is faster, done in the speedup branch. 
+    See discussion in https://github.com/srush/annotated-mamba/issues/1. 
+5. Pay attention to the weights initialization so that we can train the model from scratch.
+6. Implement the step function for mamba inference. 
 
 ## From mamba-minimal
 
