@@ -29,6 +29,7 @@ from jax.nn.initializers import lecun_normal, normal # TODO, check the differenc
 import flax
 from flax import linen as nn
 from flax.linen.initializers import normal as flax_normal
+from flax.linen.initializers import uniform, lecun_uniform
 from dataclasses import dataclass
 from einops import rearrange, repeat, einsum
 
@@ -37,6 +38,7 @@ from typing import Union
 import math
 
 from pytorch_to_jax import convert_from_pytorch
+from SSM_init import init_log_steps, log_step_initializer
 
 
 @dataclass
@@ -51,6 +53,8 @@ class ModelArgs: # The same as torch version since this does not have any torch 
     pad_vocab_size_multiple: int = 8
     conv_bias: bool = True
     bias: bool = False
+    
+    dt_scale: float =1.0,
     
     def __post_init__(self):
         self.d_inner = int(self.expand * self.d_model)
@@ -195,10 +199,12 @@ class ResidualBlock(nn.Module):
 
 class MambaBlock(nn.Module):
     args: ModelArgs
+    layer_idx: int = None
 
     def setup(self):
+        # -1/sqrt(k), 1/sqrt(k), Uniform in pytorch. 
         self.in_proj = nn.Dense(features=self.args.d_inner * 2, 
-                                kernel_init=normal(), 
+                                kernel_init=lecun_uniform(), 
                                 use_bias=self.args.bias)
         
         # Adjusted for Flax. Flax does not have nn.Conv1d, so you might need to reshape or use a different approach
@@ -210,10 +216,15 @@ class MambaBlock(nn.Module):
                               )
 
         # x_proj takes in `x` and outputs the input-specific Δ, B, C
-        self.x_proj = nn.Dense(self.args.dt_rank + self.args.d_state * 2, use_bias=False)
+        # self.x_proj = nn.Dense(self.args.dt_rank + self.args.d_state * 2, use_bias=False)
+        self.x_proj = nn.Dense(self.args.dt_rank + self.args.d_state * 2, kernel_init=lecun_uniform(), use_bias=False)
         
         # dt_proj projects Δ from dt_rank to d_in
-        self.dt_proj = nn.Dense(self.args.d_inner, use_bias=True)
+        # random initialization for dt, https://github.com/state-spaces/mamba/blob/main/mamba_ssm/modules/mamba_simple.py
+        self.dt_proj = nn.Dense(self.args.d_inner, 
+                                kernel_init=uniform(scale=self.args.dt_rank**-0.5 * self.args.dt_scale[0]), 
+                                bias_init=log_step_initializer(dt_min=0.001, dt_max=0.1),
+                                use_bias=True)
 
         A = np.tile(np.arange(1, self.args.d_state + 1), (self.args.d_inner, 1))
         self.A_log = self.param('A_log', lambda rng, shape: np.log(A), (self.args.d_inner, self.args.d_state))
