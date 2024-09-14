@@ -9,6 +9,8 @@ Plan:
     See discussion in https://github.com/srush/annotated-mamba/issues/1. 
 5. Pay attention to the weights initialization so that we can train the model from scratch.
 6. Implement the step function for mamba inference. 
+7. Upgrade the jax version to recent versions. 
+8. TODO, summarize the difference between torch and jax convolution! 
 
 ## From mamba-minimal
 
