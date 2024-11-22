@@ -38,7 +38,7 @@ from flax.linen.initializers import normal as flax_normal
 from dataclasses import dataclass
 from einops import rearrange, repeat, einsum
 
-from typing import Union, NamedTuple, TypeAlias
+from typing import Union, NamedTuple, TypeAlias, cast
 
 import math
 
@@ -54,13 +54,10 @@ class ModelArgs_Mamba2: # The same as torch version since this does not have any
     d_model: int
     n_layer: int
     vocab_size: int
-    d_state: int = 16
+    d_state: int = 128
     expand: int = 2
-    # dt_rank: Union[int, str] = 'auto'
     d_conv: int = 4 
-    pad_vocab_size_multiple: int = 8
-    # conv_bias: bool = True
-    # bias: bool = False
+    pad_vocab_size_multiple: int = 16
     headdim: int = 64
     chunk_size: int = 64
     
@@ -68,9 +65,6 @@ class ModelArgs_Mamba2: # The same as torch version since this does not have any
         self.d_inner = int(self.expand * self.d_model)
         assert self.d_inner % self.headdim == 0
         self.nheads = self.d_inner // self.headdim
-        
-        # if self.dt_rank == 'auto':
-        #     self.dt_rank = math.ceil(self.d_model / 16)
             
         if self.vocab_size % self.pad_vocab_size_multiple != 0:
             self.vocab_size += (self.pad_vocab_size_multiple
@@ -99,21 +93,6 @@ class InferenceCache(NamedTuple):
             ),
         )
 
-# class InferenceCache(NamedTuple):
-#     conv_state: Tensor  # (batch, d_inner + 2 * d_state, d_conv)
-#     ssm_state: Tensor  # (batch, nheads, headdim, d_state)
-
-#     @staticmethod
-#     def alloc(batch_size: int, args: ModelArgs_Mamba2, device: Device = None):
-#         return InferenceCache(
-#             torch.zeros(
-#                 batch_size, args.d_inner + 2 * args.d_state, args.d_conv, device=device
-#             ),
-#             torch.zeros(
-#                 batch_size, args.nheads, args.headdim, args.d_state, device=device
-#             ),
-#         )
-
 
 class Mamba2(nn.Module):
     args: ModelArgs_Mamba2
@@ -131,7 +110,7 @@ class Mamba2(nn.Module):
         return self.embedding.attend(input)
 
     @nn.compact
-    def __call__(self, input_ids):
+    def __call__(self, input_ids, h: list[InferenceCache] | list[None] | None = None):
         """
         Args:
             input_ids (long tensor): shape (b, l)    (See Glossary at top for definitions of b, l, d_in, n...)
@@ -143,19 +122,24 @@ class Mamba2(nn.Module):
             class MambaLMHeadModel, https://github.com/state-spaces/mamba/blob/main/mamba_ssm/models/mixer_seq_simple.py#L173
 
         """
+        seqlen = input_ids.shape[1]
+
+        if h is None:
+            h = [None for _ in range(self.args.n_layer)]
+
         x = self.embedding(input_ids)
         
-        for layer in self.layers:
-            x = layer(x)
+        for i, layer in enumerate(self.layers):
+            x, h[i] = layer(x) # There is a residual wrapper here. 
             
         x = self.norm_f(x)
         logits = self.attend(x)
 
-        return logits
+        return logits, cast(list[InferenceCache], h)
 
 
     @staticmethod
-    def from_pretrained(pretrained_model_name: str, tokenizer=None):
+    def from_pretrained(pretrained_model_name: str, tokenizer=None, print_config=False):
         """Load pretrained weights from HuggingFace into model.
     
         Args:
@@ -187,15 +171,14 @@ class Mamba2(nn.Module):
             return torch.load(resolved_archive_file, weights_only=True, map_location=torch.device('cpu'), mmap=True)
         
         config_data = load_config_hf(pretrained_model_name)
+        if print_config:
+            print("config_data is", config_data)
         args = ModelArgs_Mamba2(
             d_model=config_data['d_model'],
             n_layer=config_data['n_layer'],
             vocab_size=config_data['vocab_size'],
             pad_vocab_size_multiple=config_data["pad_vocab_size_multiple"],
         )   
-        # TODO
-        print("args is", args)
-
         model = Mamba2(args)
         
         state_dict = load_state_dict_hf(pretrained_model_name)
@@ -205,10 +188,14 @@ class Mamba2(nn.Module):
             new_state_dict[new_key] = state_dict[key]
         
         rng = jax.random.PRNGKey(7)
-        input_ids = tokenizer("hello how are you" * 256, return_tensors='pt').input_ids
+        input_ids = tokenizer("hello how are you" * 64, return_tensors='pt').input_ids
         input_ids = np.array(input_ids.numpy())
         random_params = model.init(rng, input_ids)
         random_params_flatten = flax.traverse_util.flatten_dict(random_params, sep=".")
+        # print the key and shape of each parameter
+        # print("Before conversion:")
+        # for key in new_state_dict:
+        #     print(key, new_state_dict[key].shape)
 
         params = convert_from_pytorch(new_state_dict, random_params_flatten)
         
@@ -246,8 +233,9 @@ class ResidualBlock(nn.Module):
                 [Norm -> Mamba -> Add] -> [Norm -> Mamba -> Add] -> [Norm -> Mamba -> Add] -> ....
             
         """
-        output = self.mixer(self.norm(x)) + x
-        return output
+        output, h = self.mixer(self.norm(x))
+        output = output + x
+        return output, h
 
 
 class Mamba2Block(nn.Module):
@@ -261,7 +249,6 @@ class Mamba2Block(nn.Module):
                                 )
         
         conv_dim = self.args.d_inner + 2 * self.args.d_state
-        print("conv_dim is", conv_dim)
         self.conv1d = nn.Conv(
             features=conv_dim,
             kernel_size=[self.args.d_conv],
@@ -270,9 +257,14 @@ class Mamba2Block(nn.Module):
             use_bias=True,
             )
 
-        self.dt_bias = nn.Dense(features=self.args.nheads, use_bias=True)
-        self.A_log = nn.Dense(features=self.args.nheads, use_bias=True)
-        self.D = nn.Dense(features=self.args.nheads, use_bias=True)
+        dt = np.tile(np.arange(1, self.args.nheads + 1), (1))
+        self.dt_bias = self.param('dt_bias', lambda rng, shape: np.log(dt), (self.args.nheads))
+        A = np.tile(np.arange(1, self.args.nheads + 1), (1))
+        self.A_log = self.param('A_log', lambda rng, shape: np.log(A), (self.args.nheads))
+        D_tmp = np.tile(np.arange(1, self.args.nheads + 1), (1))
+        self.D = self.param('D', lambda rng, shape: np.log(D_tmp), (self.args.nheads))
+        # self.D = nn.Dense(features=self.args.nheads, use_bias=False)
+
         self.norm = RMSNorm(self.args.d_inner)
         self.out_proj = nn.Dense(self.args.d_model, kernel_init=normal(), use_bias=False)
 
@@ -291,11 +283,11 @@ class Mamba2Block(nn.Module):
         if h is not None:
             return self.step(x, h)
         else:
-            A = -np.exp(self.A_log(x)) # (nheads, )
+            A = -np.exp(self.A_log) # (nheads, )
             zxbcdt = self.in_proj(x) # (b, l, d_in_proj)
             # https://jax.readthedocs.io/en/latest/_autosummary/jax.numpy.split.html
             z, xBC, dt = np.split(zxbcdt, [self.args.d_inner, 2 * self.args.d_inner + 2 * self.args.d_state], axis=-1)
-        dt = jax.nn.softplus(dt + self.dt_bias(x))
+        dt = jax.nn.softplus(dt + self.dt_bias) # b, l, dheads
 
         # Pad or truncate xBC seqlen to d_conv
         conv_state = np.pad(rearrange(xBC, "b l d -> b d l"), max(self.args.d_conv - x.shape[1], 0)) # Incorrect for now
@@ -313,9 +305,10 @@ class Mamba2Block(nn.Module):
             rearrange(B, "b l n -> b l 1 n"),
             rearrange(C, "b l n -> b l 1 n"),
             self.args.chunk_size,
-        )
+        ) # b l h p
 
-        y = y + x * self.D.unsqueeze(-1)
+        y = y + np.einsum("b l h p, h-> b l h p", x, self.D)
+
         y = rearrange(y, "b l h p -> b l (h p)")
         y = self.norm(y, z)
         y = self.out_proj(y)
@@ -325,8 +318,40 @@ class Mamba2Block(nn.Module):
         return y, h
 
 
-    def step(self, x):
-        pass
+    def step(self, x, h: InferenceCache):
+        assert x.shape[1] == 1, "step() only supports single timestep inputs"
+
+        zxbcdt = self.in_proj(x.squeeze(1)) # (b, d_in_proj)
+        z, xBC, dt = np.split(zxbcdt, [self.args.d_inner, 2 * self.args.d_inner + 2 * self.args.d_state], axis=-1)
+
+        # Advance convolution input
+        h.conv_state.copy_(torch.roll(h.conv_state, shifts=-1, dims=-1))
+        h.conv_state[:, :, -1] = xBC
+        # Convolution step
+        xBC = torch.sum(
+            h.conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1
+        )
+        xBC += self.conv1d.bias
+        xBC = jax.nn.silu(xBC)
+
+        x, B, C = np.split(
+            xBC, [self.args.d_inner, self.args.d_inner + self.args.d_state], axis=-1
+        )
+        A = -np.exp(self.A_log)  # (nheads,)
+
+        # SSM step
+        dt = jax.nn.softplus(dt + self.dt_bias)  # (batch, nheads)
+        dA = np.exp(dt * A)  # (batch, nheads)
+        x = rearrange(x, "b (h p) -> b h p", p=self.args.headdim)
+        dBx = np.einsum("bh, bn, bhp -> bhpn", dt, B, x)
+        h.ssm_state.copy_(h.ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
+        y = np.einsum("bhpn, bn -> bhp", h.ssm_state, C)
+        y = y + rearrange(self.D, "h -> h 1") * x
+        y = rearrange(y, "b h p -> b (h p)")
+        y = self.norm(y, z)
+        y = self.out_proj(y)
+
+        return np.expand_dims(y, -1), h
 
 
 def segsum(x):
@@ -366,8 +391,10 @@ def ssd(x, A, B, C, chunk_size, initial_states=None):
     1. https://tridao.me/blog/2024/mamba2-part3-algorithm/
     2. https://github.com/state-spaces/mamba/blob/219f03c840d5a44e7d42e4e728134834fddccf45/mamba_ssm/modules/ssd_minimal.py#L34-L78
     """
-    print(x.shape, chunk_size)
-    assert x.shape[1] % chunk_size == 0
+    # print(x.shape, chunk_size)
+    # if the length is not enough, the solution is to pad the input
+    # assert x.shape[1] % chunk_size == 0
+    chunk_size = x.shape[1]
 
     # Rearrange into chunks
     x, A, B, C = [rearrange(m, "b (c l) ... -> b c l ...", l=chunk_size) for m in (x, A, B, C)]
@@ -387,17 +414,20 @@ def ssd(x, A, B, C, chunk_size, initial_states=None):
     # decay_states = torch.exp(A_cumsum[:, :, :, -1:] - A_cumsum)
     decay_states = np.exp(A_cumsum[:, :, :, -1:] - A_cumsum)
     # states = torch.einsum("bclhn, bhcl, bclhp -> bchpn", B, decay_states, x)
-    state = np.einsum("b c l h n, b h c l, b c l h p -> b c h p n", B, decay_states, x)
+    states = np.einsum("b c l h n, b h c l, b c l h p -> b c h p n", B, decay_states, x)
 
     # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
     # (middle term of factorization of off-diag blocks; A terms)
     if initial_states is None:
         # initial_states = torch.zeros_like(states[:, :1])
-        initial_states = np.zeros_like(state[:, :1])
+        initial_states = np.zeros_like(states[:, :1])
     # states = torch.cat([initial_states, states], dim=1)
     states = np.concatenate([initial_states, states], axis=1)
+    # https://numpy.org/doc/stable/reference/generated/numpy.pad.html#numpy.pad
+    # https://jax.readthedocs.io/en/latest/_autosummary/jax.numpy.pad.html
+    # https://pytorch.org/docs/stable/generated/torch.nn.functional.pad.html
     # decay_chunk = torch.exp(segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0)), device=device))
-    decay_chunk = np.exp(segsum(np.pad(A_cumsum[:, :, :, -1], ((0, 0), (1, 0)))))
+    decay_chunk = np.exp(segsum(np.pad(A_cumsum[:, :, :, -1], ((0, 0), (0, 0), (1, 0)))))
     # new_states = torch.einsum("bhzc, bchpn -> bzhpn", decay_chunk, states)
     new_states = np.einsum("b h z c, b c h p n -> b z h p n", decay_chunk, states)
     states, final_state = new_states[:, :-1], new_states[:, -1]
@@ -424,7 +454,7 @@ class RMSNorm(nn.Module):
         if z is not None:
             x = x * jax.nn.silu(z)
 
-        weight = self.param('weight', nn.initializers.ones, (self.d_model,)) 
+        weight = self.param('weight', nn.initializers.ones, (self.d_model,), dtype=np.float16) 
         normed = x * jax.lax.rsqrt(np.mean(np.square(x), axis=-1, keepdims=True) + self.eps)
         output = normed * weight
         return output

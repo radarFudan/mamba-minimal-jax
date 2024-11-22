@@ -1,6 +1,8 @@
 from typing import Dict
 
+import numpy as np
 import flax
+
 
 def convert_from_pytorch(pt_state: Dict, params_flatten):
     """_summary_
@@ -49,7 +51,12 @@ def convert_from_pytorch(pt_state: Dict, params_flatten):
             jax_state_transposed[key] = jax_state[key]
 
         if params_flatten[key].dtype != jax_state[key].dtype:
-            jax_state_transposed[key] = jax_state_transposed[key].numpy()
+            # Check if it's already numpy
+            if isinstance(jax_state_transposed[key], np.ndarray):
+                # Check datatype
+                jax_state_transposed[key] = jax_state_transposed[key].astype(params_flatten[key].dtype)
+            else:
+                jax_state_transposed[key] = jax_state_transposed[key].numpy()
         else:
             jax_state_transposed[key] = jax_state_transposed[key]
 
